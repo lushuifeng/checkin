@@ -1,8 +1,6 @@
 # Checkin
 
-GitHub Actions 实现 [GLaDOS][glados] 自动签到
-
-([GLaDOS][glados] 可用邀请码: `MW4DK-O0RSF-C7AOU-EN1MP`, 双方都有奖励天数)
+[GitHub Actions 实现 GLaDOS 自动签到](https://zhuanlan.zhihu.com/p/616919265)
 
 ## 使用说明
 
