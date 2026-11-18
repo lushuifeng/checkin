@@ -1,5 +1,3 @@
-import { createHash } from 'node:crypto'
-
 // ========== 工具函数：敏感信息脱敏 ==========
 const mask = (str, startLen = 4, endLen = 4) => {
   if (!str || typeof str !== 'string') return '***'
@@ -7,26 +5,9 @@ const mask = (str, startLen = 4, endLen = 4) => {
   return str.slice(0, startLen) + '****' + str.slice(-endLen)
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
-
 // ========== 默认 UA ==========
 const DEFAULT_UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'
-
-// ========== 签到挑战（challenge）协议常量 ==========
-// 逆向自 glados.cloud 前端 main~20e9f87d.chunk.js 模块 613：
-//   checkinProof(nonce) = SHA256_HEX(nonce + "." + "glados-observe-v1")
-// 全流程：
-//   1) GET  /api/user/checkin/challenge  -> { code:0, nonce, ttl }
-//   2) 等待 >= 2500ms（前端强制的人类反应时间下限）
-//   3) POST /api/user/checkin  body: { token:<hostname>, nonce, proof }
-// 缺 nonce/proof 的裸请求服务端仍返回 code:0，但只给 Base 档保底积分。
-const PROOF_SALT = 'glados-observe-v1'
-const MIN_HUMAN_DELAY_MS = 2500 // 前端硬性下限
-const EXCELLENT_DELAY_MAX_MS = 5000 // 前端评级 excellent 上限（<=5s）
-
-const checkinProof = (nonce) =>
-  createHash('sha256').update(`${nonce}.${PROOF_SALT}`, 'utf8').digest('hex')
 
 // ========== 积分构成还原 ==========
 // 逆向自 renderPointsBreakdown()：
@@ -46,9 +27,10 @@ const cableBonus = (score) => {
   return 1
 }
 
-// ========== 判定辅助：服务端是否「看起来成功、实际降级」 ==========
-// 协议变更时服务端未必直接报错，可能返回 code:0 但只给 Base 保底分，
-// 或返回 code:1 假装已签到。因此不能只看 code，必须交叉核对得分与流水。
+// ========== 检查模式说明 ==========
+// 本脚本只做「检查今天是否已经签到」，不执行签到请求（不 POST /api/user/checkin）。
+// 判断依据：积分流水（/api/user/points 的 history）里是否含今天的记录。
+
 const BEIJING_OFFSET_MS = 8 * 3600 * 1000
 
 const beijingDate = (input) => {
@@ -72,8 +54,20 @@ const hasRecordToday = (list) => {
   return dates.includes(today)
 }
 
+// ========== 检查时段（早 / 晚） ==========
+// run.yml 的两条 cron 对应北京时间 10:07（早）与 21:07（晚）。
+// GitHub Actions 的 schedule 不保证准时（延迟可达数小时），因此不比对 cron 表达式，
+// 而是按「执行时刻的北京时间」判定时段：
+//   05:00-17:59 视为早检查 → 无论结果都推送通知
+//   其余时间视为晚检查   → 仅在有账号未签到 / 异常时推送通知
+const beijingHour = () => new Date(Date.now() + BEIJING_OFFSET_MS).getUTCHours()
+const isMorningSlot = () => {
+  const h = beijingHour()
+  return h >= 5 && h < 18
+}
+
 // ========== 浏览器请求头构造 ==========
-// 浏览器发起签到时会带上 sec-ch-ua / sec-fetch-* 等一组头部，
+// 浏览器发起请求时会带上 sec-ch-ua / sec-fetch-* 等一组头部，
 // 这些头部与 UA 中的平台、内核大版本必须自洽，否则容易被判为伪造。
 const detectPlatform = (ua) => {
   const s = String(ua || '')
@@ -200,52 +194,19 @@ const collectAccounts = () => {
   return accounts
 }
 
-// ========== 带挑战的签到 ==========
-const doCheckin = async (domain, headers) => {
-  // 1) 取挑战
-  const chRes = await fetch(`https://${domain}/api/user/checkin/challenge`, {
-    method: 'GET',
-    headers,
-  })
-  if (!chRes.ok) throw new Error(`挑战接口HTTP错误: ${chRes.status} ${chRes.statusText}`)
-  const ch = await chRes.json()
-  if (ch?.code !== 0 || !ch?.nonce) {
-    throw new Error(`获取签到挑战失败: ${ch?.message || '未返回 nonce'} (code=${ch?.code})`)
-  }
-  const ttl = Number(ch.ttl) || 300000
-  console.log(`  挑战已获取: nonce=${mask(String(ch.nonce), 6, 4)} ttl=${ttl}ms`)
-
-  // 2) 等待人类反应时间（前端下限 2500ms，落在 excellent 档 <=5s）
-  const wait = MIN_HUMAN_DELAY_MS + 300 + Math.floor(Math.random() * 1700)
-  console.log(`  等待 ${wait}ms 后提交（模拟人类反应，excellent 档 <=${EXCELLENT_DELAY_MAX_MS}ms）`)
-  await sleep(wait)
-
-  // 3) 计算 proof 并提交
-  const proof = checkinProof(String(ch.nonce))
-  console.log(`  proof=${mask(proof, 8, 8)}`)
-
-  const res = await fetch(`https://${domain}/api/user/checkin`, {
-    method: 'POST',
-    headers: { ...headers, 'content-type': 'application/json' },
-    body: JSON.stringify({ token: domain, nonce: ch.nonce, proof }),
-  })
-  if (!res.ok) throw new Error(`签到接口HTTP错误: ${res.status} ${res.statusText}`)
-  return res.json()
-}
-
-// ========== GLaDOS 签到核心逻辑 ==========
-const glados = async () => {
+// ========== GLaDOS 签到状态检查核心逻辑（只检查，不签到） ==========
+const checkToday = async () => {
   const notice = []
   const pointsSummary = []
-  let successCount = 0
+  let okCount = 0
   let failCount = 0
-  let criticalAnomalies = 0
-  console.log('========== GLaDOS 签到任务开始 ==========')
+  console.log('========== GLaDOS 签到状态检查任务开始 ==========')
+  console.log(`⏰ 检查时段: ${isMorningSlot() ? '早（无论结果都通知）' : '晚（仅未签到/异常时通知）'}`)
 
   const accounts = collectAccounts()
   if (!accounts.length) {
-    console.log('⚠️  未配置 GLADOS / GLADOS2 / GLADOS3… 任一环境变量，跳过签到任务')
-    return notice
+    console.log('⚠️  未配置 GLADOS / GLADOS2 / GLADOS3… 任一环境变量，跳过检查任务')
+    return { notice, okCount, failCount }
   }
 
   const sources = [...new Set(accounts.map((a) => a.envName))]
@@ -256,7 +217,7 @@ const glados = async () => {
     const accountNo = index + 1
     const tag = `账号 ${accountNo}|${account.envName}`
     const anomalies = []
-    console.log(`\n[${tag}] ---------- 开始处理 ----------`)
+    console.log(`\n[${tag}] ---------- 开始检查 ----------`)
     console.log(`[${tag}] Cookie: ${mask(account.cookie)}`)
 
     const diag = diagnoseCookie(account.cookie)
@@ -282,35 +243,7 @@ const glados = async () => {
       console.log(`[${tag}] 目标域名: ${domain}`)
       console.log(`[${tag}] UA(${account.uaSource}): ${mask(ua, 8, 8)}`)
 
-      // 1. 带挑战签到
-      console.log(`[${tag}] 正在执行签到请求（含 challenge）...`)
-      const action = await doCheckin(domain, headers)
-      console.log(`[${tag}] 签到接口响应码: ${action?.code ?? '无'}`)
-
-      const alreadyCheckedIn = action?.code === 1
-      if (action?.code === 4 && action?.reason === 'device-mismatch') {
-        throw new Error(
-          `设备校验不通过（device-mismatch）：当前 UA/会话与登录设备不一致。` +
-            `loginDevice=${action?.loginDevice || '?'} currentDevice=${action?.currentDevice || '?'}。` +
-            `请用同一浏览器重新登录并同步更新 Cookie 与 GLADOS_UA`
-        )
-      }
-      if (action?.code !== 0 && !alreadyCheckedIn) {
-        throw new Error(
-          `${action?.message || '签到失败'} (code=${action.code}${action?.reason ? ', reason=' + action.reason : ''})`
-        )
-      }
-      let gained = null
-      if (alreadyCheckedIn) {
-        console.log(`[${tag}] 今日已签到过，继续查询剩余天数与积分...`)
-      } else {
-        gained = Number(action?.points)
-        console.log(
-          `[${tag}] 本次获得积分: ${Number.isFinite(gained) ? gained + ' 分' : '未返回'} | 服务端消息: ${action?.message || ''}`
-        )
-      }
-
-      // 2. 账号状态
+      // 1. 账号状态
       console.log(`[${tag}] 正在获取账号状态...`)
       const statusRes = await fetch(`https://${domain}/api/user/status`, { method: 'GET', headers })
       if (!statusRes.ok) throw new Error(`状态接口HTTP错误: ${statusRes.status} ${statusRes.statusText}`)
@@ -321,11 +254,12 @@ const glados = async () => {
       }
       const leftDays = Number(status?.data?.leftDays)
 
-      // 3. 积分 + 加成构成
+      // 2. 积分 + 流水 → 判断今天是否已签到
       let currentPoints = null
       let bonusLine = ''
+      let checkedInToday = null
       try {
-        console.log(`[${tag}] 正在获取积分...`)
+        console.log(`[${tag}] 正在获取积分与流水...`)
         const pointsRes = await fetch(`https://${domain}/api/user/points`, { method: 'GET', headers })
         if (!pointsRes.ok) throw new Error(`积分接口HTTP错误: ${pointsRes.status}`)
         const pointsData = await pointsRes.json()
@@ -338,7 +272,20 @@ const glados = async () => {
         console.log(`[${tag}] 💰 当前积分: ${currentPoints} 点 | 连续签到: ${streak} 天`)
         pointsSummary.push(`账号${accountNo}(${account.envName}): ${currentPoints} 点 / 连续 ${streak} 天`)
 
-        // 4. 光缆质量指数（决定 Cable 档加成，最高 +8）
+        checkedInToday = hasRecordToday(history)
+        if (checkedInToday === true) {
+          console.log(`[${tag}] ✅ 积分流水含今日记录，今日已签到`)
+        } else if (checkedInToday === false) {
+          console.log(`[${tag}] ⚠️ 积分流水不含今日记录，今日尚未签到`)
+        } else {
+          console.log(`[${tag}] ⚠️ 积分流水结构无法解析，无法确认今日是否已签到`)
+          anomalies.push({
+            level: 'critical',
+            text: '积分流水结构无法解析，无法确认今日是否已签到（接口结构可能已变化）',
+          })
+        }
+
+        // 3. 光缆质量指数（决定 Cable 档加成，最高 +8）
         let iqiScore = null
         try {
           const iqiRes = await fetch(`https://${domain}/api/user/iqi`, { method: 'GET', headers })
@@ -366,60 +313,14 @@ const glados = async () => {
           `套餐+${pB} / 连续+${sB} / 光缆+${cB}` +
           (iqiScore != null ? `（IQI=${iqiScore}）` : '（IQI 未取到）')
         console.log(`[${tag}] 📈 加成构成: ${bonusLine}`)
-        if (iqiScore != null) {
-          if (iqiScore < 80) {
-            console.log(`[${tag}] 🎯 当前光缆指数处于低谷，Cable 加成已达最高档 +8`)
-          } else if (iqiScore < 85) {
-            console.log(`[${tag}] 光缆指数 ${iqiScore}，Cable 为 +5 档（低于 80 才能拿到 +8）`)
-          }
-        }
-
-        // 5. 交叉校验：识别「接口成功但实际降级」的情况
-        const expectedMin = 1 + pB + sB + cB
-        if (!alreadyCheckedIn && Number.isFinite(gained)) {
-          if (gained < expectedMin) {
-            anomalies.push({
-              level: 'critical',
-              text: `得分低于理论下限：实得 ${gained} 分 < ${expectedMin} 分（Base1+套餐${pB}+连续${sB}+光缆${cB}）`,
-            })
-            console.log(
-              `[${tag}] 🚨 得分异常: ${gained} 分低于理论下限 ${expectedMin} 分，存在加成项未生效`
-            )
-          } else {
-            console.log(`[${tag}] ✅ 得分校验通过: ${gained} ≥ 理论下限 ${expectedMin}`)
-          }
-        }
-        if (!alreadyCheckedIn && Number(streak) === 0) {
-          anomalies.push({
-            level: 'warning',
-            text: '签到成功但连续天数为 0，Streak 加成将无法累计',
-          })
-          console.log(`[${tag}] 🚨 连续天数异常: 签到成功却 streak=0`)
-        }
-        if (alreadyCheckedIn) {
-          const recorded = hasRecordToday(history)
-          if (recorded === false) {
-            anomalies.push({
-              level: 'critical',
-              text: '返回「今日已签到」但积分流水中没有今天的记录',
-            })
-            console.log(
-              `[${tag}] 🚨 状态矛盾: 响应称今日已签到，但流水无今日记录，服务端可能改用其他 code 表达降级`
-            )
-          } else if (recorded === null) {
-            console.log(`[${tag}] ℹ️ 积分流水结构无法解析，跳过今日记录校验`)
-          } else {
-            console.log(`[${tag}] ✅ 已签到状态校验通过: 流水含今日记录`)
-          }
-        }
       } catch (pointsErr) {
         console.warn(`[${tag}] ⚠️ 积分查询失败: ${pointsErr.message}`)
         pointsSummary.push(`账号${accountNo}(${account.envName}): 查询失败`)
+        anomalies.push({ level: 'critical', text: `积分查询失败: ${pointsErr.message}` })
       }
 
-      // 5. 自动兑换
+      // 4. 自动兑换
       const autoExchange = String(process.env.AUTO_EXCHANGE || 'true').toLowerCase() !== 'false'
-       console.log(`[${autoExchange}]`)
       const exchangeThreshold = Number(process.env.EXCHANGE_THRESHOLD || 500)
       if (autoExchange && currentPoints != null && currentPoints >= exchangeThreshold) {
         try {
@@ -440,7 +341,7 @@ const glados = async () => {
             `剩余积分: ${remain}`
           )
         } catch (exErr) {
-          console.error(`[${tag}] ⚠️ 自动兑换异常（不影响签到结果）: ${exErr.message}`)
+          console.error(`[${tag}] ⚠️ 自动兑换异常（不影响检查结果）: ${exErr.message}`)
           notice.push(`【账号${accountNo}】自动兑换失败`, `错误: ${exErr.message}`)
         }
       } else if (autoExchange) {
@@ -451,34 +352,46 @@ const glados = async () => {
         console.log(`[${tag}] 自动兑换已关闭`)
       }
 
-      console.log(`[${tag}] ✅ ${alreadyCheckedIn ? '今日已签到过' : '签到成功'}`)
-      console.log(`[${tag}] 返回消息: ${action?.message || ''}`)
-      console.log(`[${tag}] 剩余天数: ${leftDays} 天`)
-      console.log(`[${tag}] 当前积分: ${currentPoints != null ? currentPoints + ' 点' : '查询失败'}`)
-
       if (anomalies.length) {
         console.log(`[${tag}] ⚠️ 检出 ${anomalies.length} 项异常:`)
         anomalies.forEach((item) => console.log(`[${tag}]    · [${item.level}] ${item.text}`))
-        criticalAnomalies += anomalies.filter((a) => a.level === 'critical').length
       }
 
-      const summaryLines = [
-        `【账号${accountNo}】签到成功`,
-        `${alreadyCheckedIn ? '今日已签到过（无新增积分）' : action?.message}`,
-        `剩余天数: ${leftDays} 天`,
-        `当前积分: ${currentPoints != null ? currentPoints + ' 点' : '查询失败'}${bonusLine ? ' | ' + bonusLine : ''}`,
-      ]
-      if (anomalies.length) {
-        summaryLines.push(`⚠️ 异常提示: ${anomalies.map((a) => a.text).join('；')}`)
+      console.log(`[${tag}] ${checkedInToday === true ? '✅ 今日已签到' : '❌ 今日未签到/无法确认'}`)
+      console.log(`[${tag}] 剩余天数: ${leftDays} 天`)
+      console.log(`[${tag}] 当前积分: ${currentPoints != null ? currentPoints + ' 点' : '查询失败'}`)
+
+      const pointsLine =
+        `当前积分: ${currentPoints != null ? currentPoints + ' 点' : '查询失败'}` +
+        `${bonusLine ? ' | ' + bonusLine : ''}`
+      if (checkedInToday === true) {
+        notice.push(
+          `【账号${accountNo}】今日已签到`,
+          `剩余天数: ${leftDays} 天`,
+          pointsLine,
+          ...anomalies.map((a) => `⚠️ 异常提示: ${a.text}`)
+        )
+        okCount++
+      } else {
+        const reason =
+          checkedInToday === false
+            ? '今日尚未签到，请手动签到'
+            : '无法确认今日是否已签到（积分流水解析失败）'
+        notice.push(
+          `【账号${accountNo}】${reason}`,
+          `手动签到地址: https://${domain}/console/checkin`,
+          `剩余天数: ${leftDays} 天`,
+          pointsLine,
+          ...anomalies.map((a) => `⚠️ 异常提示: ${a.text}`)
+        )
+        failCount++
       }
-      notice.push(...summaryLines)
-      successCount++
     } catch (error) {
-      console.error(`[${tag}] ❌ 签到失败`)
+      console.error(`[${tag}] ❌ 检查失败`)
       console.error(`[${tag}] 错误详情: ${error.message}`)
 
       notice.push(
-        `【账号${accountNo}】签到失败`,
+        `【账号${accountNo}】检查失败`,
         `错误: ${error.message}`,
         `仓库地址: <${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}>`
       )
@@ -493,13 +406,18 @@ const glados = async () => {
     console.log('📊 无账号积分数据')
   }
   console.log('===================================')
-  console.log('\n========== 签到任务处理完成 ==========')
-  console.log(`📊 统计结果：成功 ${successCount} 个 | 失败 ${failCount} 个`)
-  if (criticalAnomalies > 0) {
-    console.error(`🚨 共检出 ${criticalAnomalies} 项严重异常，本次任务标记为失败`)
-    process.exitCode = 1
-  }
-  return notice
+  console.log('\n========== 签到状态检查任务完成 ==========')
+  console.log(`📊 统计结果：已签到 ${okCount} 个 | 未签到/异常 ${failCount} 个`)
+
+  const slotLabel = isMorningSlot() ? '早' : '晚'
+  const total = okCount + failCount
+  const title =
+    failCount === 0
+      ? `【GLaDOS 检查·${slotLabel}】全部账号今日已签到（${okCount}/${total}）`
+      : `【GLaDOS 检查·${slotLabel}】${failCount}/${total} 个账号未签到/异常`
+  notice.unshift(title)
+
+  return { notice, okCount, failCount }
 }
 
 // ========== 通知推送模块（保持原样） ==========
@@ -633,8 +551,16 @@ const notify = async (notice) => {
 
 // ========== 主入口 ==========
 const main = async () => {
-  const notice = await glados()
-  await notify(notice)
+  const { notice, failCount } = await checkToday()
+  if (!isMorningSlot() && failCount === 0) {
+    console.log('\n🌙 晚间检查：全部账号今日已签到，跳过通知')
+  } else {
+    await notify(notice)
+  }
+  if (failCount > 0) {
+    // 有账号未签到/异常时标记任务失败，GitHub 也会向仓库 owner 发送失败邮件
+    process.exitCode = 1
+  }
   console.log('\n🎉 全部任务执行完毕')
 }
 
