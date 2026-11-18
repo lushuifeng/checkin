@@ -1,8 +1,18 @@
 name: Keep GitHub Actions Active
 
+# 自动提交规则
+# ---------------------------------------------------------------------------
+# GitHub 会在仓库 60 天无任何提交后停用 scheduled workflows。
+# 本 workflow 每天跑一次（UTC 02:23 = 北京时间 10:23，避开整点拥堵），
+# 检查「最后一次提交距今是否已满 50 天」：
+#   - 未满 50 天：什么都不做，本次运行直接跳过
+#   - 已满 50 天：更新 .github/keepalive.txt 并提交推送一次，刷新活跃计时
+# 50 天 < 60 天禁用线，留出 10 天余量，保证触发时 workflow 仍可运行。
+# ---------------------------------------------------------------------------
+
 on:
   schedule:
-    - cron: "0 1 1 * *"   # 每月1号 UTC 01:00 自动执行
+    - cron: "23 2 * * *"
   workflow_dispatch:      # 可以手动执行一次
 
 permissions:
@@ -16,15 +26,20 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Update keepalive timestamp
+      - name: Commit only if last update is 50+ days old
         run: |
+          LAST_TS=$(git log -1 --format=%ct)
+          NOW=$(date +%s)
+          AGE_DAYS=$(( (NOW - LAST_TS) / 86400 ))
+          echo "距上次提交已 ${AGE_DAYS} 天"
+          if [ "$AGE_DAYS" -lt 50 ]; then
+            echo "未满 50 天，本次不提交"
+            exit 0
+          fi
           mkdir -p .github
           echo "Last keepalive: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" > .github/keepalive.txt
-
-      - name: Commit and push changes
-        run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .github/keepalive.txt
-          git commit -m "chore: keep actions active" || exit 0
+          git commit -m "chore: keep actions active (last update ${AGE_DAYS}d ago)"
           git push
