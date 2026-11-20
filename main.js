@@ -55,16 +55,23 @@ const hasRecordToday = (list) => {
 }
 
 // ========== 检查时段（早 / 晚） ==========
-// run.yml 的两条 cron 对应北京时间 10:07（早）与 21:07（晚）。
-// GitHub Actions 的 schedule 不保证准时（延迟可达数小时），因此不比对 cron 表达式，
-// 而是按「执行时刻的北京时间」判定时段：
-//   05:00-17:59 视为早检查 → 无论结果都推送通知
-//   其余时间视为晚检查   → 仅在有账号未签到 / 异常时推送通知
+// run.yml 有两条 cron（已提前 8h 补偿 GitHub 调度延迟，实际约在北京 10:07 / 21:07 执行），
+// 并通过 CHECK_SLOT 环境变量显式声明时段（由「触发本次运行的 cron 表达式」决定，
+// 不受调度延迟影响）。本地运行未设置 CHECK_SLOT 时，回退为按执行时刻的北京小时判定。
+//
+// 通知策略：
+//   早检查（非凌晨） → 无论结果都推送通知
+//   晚检查           → 仅在有账号未签到 / 异常时推送通知
+//   凌晨 00:00-05:59 → 「未签到」视为正常（当天刚开始，本就该未签），静默不通知；
+//                      仅接口异常才推送
 const beijingHour = () => new Date(Date.now() + BEIJING_OFFSET_MS).getUTCHours()
-const isMorningSlot = () => {
+const resolveSlot = () => {
+  const s = process.env.CHECK_SLOT
+  if (s === 'morning' || s === 'evening') return s
   const h = beijingHour()
-  return h >= 5 && h < 18
+  return h >= 5 && h < 18 ? 'morning' : 'evening'
 }
+const isQuietHours = () => beijingHour() < 6
 
 // ========== 浏览器请求头构造 ==========
 // 浏览器发起请求时会带上 sec-ch-ua / sec-fetch-* 等一组头部，
@@ -199,9 +206,14 @@ const checkToday = async () => {
   const notice = []
   const pointsSummary = []
   let okCount = 0
-  let failCount = 0
+  let unsignedCount = 0 // 今日尚未签到（凌晨时段属正常，不算异常）
+  let errorCount = 0 // 接口异常 / 无法确认（任何时段都算异常）
+  const slot = resolveSlot()
+  const quiet = isQuietHours()
   console.log('========== GLaDOS 签到状态检查任务开始 ==========')
-  console.log(`⏰ 检查时段: ${isMorningSlot() ? '早（无论结果都通知）' : '晚（仅未签到/异常时通知）'}`)
+  const slotDesc =
+    slot === 'morning' ? '早（无论结果都通知）' : '晚（仅有账号未签到 / 异常时通知）'
+  console.log(`⏰ 检查时段: ${slotDesc}${quiet ? ' | 当前为凌晨时段（00:00-05:59）：未签到视为正常，仅异常才通知' : ''}`)
 
   const accounts = collectAccounts()
   if (!accounts.length) {
@@ -384,7 +396,8 @@ const checkToday = async () => {
           pointsLine,
           ...anomalies.map((a) => `⚠️ 异常提示: ${a.text}`)
         )
-        failCount++
+        if (checkedInToday === false) unsignedCount++
+        else errorCount++
       }
     } catch (error) {
       console.error(`[${tag}] ❌ 检查失败`)
@@ -395,7 +408,7 @@ const checkToday = async () => {
         `错误: ${error.message}`,
         `仓库地址: <${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}>`
       )
-      failCount++
+      errorCount++
     }
   }
 
@@ -407,17 +420,23 @@ const checkToday = async () => {
   }
   console.log('===================================')
   console.log('\n========== 签到状态检查任务完成 ==========')
-  console.log(`📊 统计结果：已签到 ${okCount} 个 | 未签到/异常 ${failCount} 个`)
+  console.log(
+    `📊 统计结果：已签到 ${okCount} 个 | 未签到 ${unsignedCount} 个 | 异常 ${errorCount} 个`
+  )
 
-  const slotLabel = isMorningSlot() ? '早' : '晚'
-  const total = okCount + failCount
+  const slotLabel = slot === 'morning' ? '早' : '晚'
+  const total = okCount + unsignedCount + errorCount
+  const problems = [
+    unsignedCount > 0 ? `未签到 ${unsignedCount}` : null,
+    errorCount > 0 ? `异常 ${errorCount}` : null,
+  ].filter(Boolean)
   const title =
-    failCount === 0
+    problems.length === 0
       ? `【GLaDOS 检查·${slotLabel}】全部账号今日已签到（${okCount}/${total}）`
-      : `【GLaDOS 检查·${slotLabel}】${failCount}/${total} 个账号未签到/异常`
+      : `【GLaDOS 检查·${slotLabel}】${total} 个账号中：${problems.join('、')}`
   notice.unshift(title)
 
-  return { notice, okCount, failCount }
+  return { notice, okCount, unsignedCount, errorCount }
 }
 
 // ========== 通知推送模块（保持原样） ==========
@@ -551,13 +570,27 @@ const notify = async (notice) => {
 
 // ========== 主入口 ==========
 const main = async () => {
-  const { notice, failCount } = await checkToday()
-  if (!isMorningSlot() && failCount === 0) {
-    console.log('\n🌙 晚间检查：全部账号今日已签到，跳过通知')
+  const { notice, unsignedCount, errorCount } = await checkToday()
+  const slot = resolveSlot()
+  const quiet = isQuietHours()
+
+  // 通知决策：
+  //   - 凌晨（00:00-05:59）：「未签到」是正常状态（当天刚开始），只有异常才值得叫醒人
+  //   - 早检查（非凌晨）：无论结果都通知
+  //   - 晚检查：仅有账号未签到 / 异常时通知
+  const shouldNotify =
+    !quiet && slot === 'morning' ? true : errorCount > 0 || (!quiet && unsignedCount > 0)
+
+  if (!shouldNotify) {
+    const reason = quiet ? '凌晨时段且无异常' : '晚检查且全部账号今日已签到'
+    console.log(`\n🌙 跳过通知（${reason}）`)
   } else {
     await notify(notice)
   }
-  if (failCount > 0) {
+
+  // 任务成败判定与通知口径一致：凌晨的「未签到」不计失败
+  const failForExit = errorCount + (quiet ? 0 : unsignedCount)
+  if (failForExit > 0) {
     // 有账号未签到/异常时标记任务失败，GitHub 也会向仓库 owner 发送失败邮件
     process.exitCode = 1
   }

@@ -5,25 +5,34 @@ name: run
 # 本 workflow 只做「检查当天是否已签到」，不执行签到（不 POST /api/user/checkin）。
 # 判断依据：积分流水（/api/user/points 的 history）是否含今天的记录。
 #
-# 每天检查两次：
-#   - cron '7 2 * * *'  = UTC 02:07 = 北京时间 10:07（早检查，避开整点拥堵）
-#   - cron '7 13 * * *' = UTC 13:07 = 北京时间 21:07（晚检查）
+# 【关于 cron 时间与实际执行时间的偏差】
+# GitHub 对低活跃仓库的 scheduled workflow 有 4~8 小时的调度延迟（不可控，
+# 本仓库实测近期稳定在 ~8h：cron 02:07 实际 10:10 执行、cron 13:07 实际 21:16 执行）。
+# 因此 cron 刻意提前 8 小时补偿，让实际执行落回目标时间：
+#   - cron '7 18 * * *' = UTC 18:07（计划北京 02:07）→ 实际约北京 10:07 早检查
+#   - cron '7 5 * * *'  = UTC 05:07（计划北京 13:07）→ 实际约北京 21:07 晚检查
 #
-# 通知策略（main.js 按执行时刻的北京时间自动判定时段）：
+# 通知策略（时段由「触发本次运行的 cron 表达式」决定，见 Determine check slot 步骤，
+# 不受调度延迟影响；补偿失准导致实际执行落在北京 00:00-05:59 时 main.js 会静默普通通知）：
 #   - 早检查：无论结果都推送通知
 #   - 晚检查：仅有账号未签到 / 异常时推送通知
-#
-# GitHub Actions 的 cron 使用 UTC，且官方明确说明「高负载时会延迟，不保证准时」，
-# 实测延迟通常在数分钟到 1 小时之间，刻意避开整点。
 #
 # 【重要】不要保留 push 触发器：任何一次 commit/push 都会立刻跑一次检查。
 # 改由 schedule + 手动 dispatch 触发。
 # ---------------------------------------------------------------------------
 on:
   workflow_dispatch:
+    inputs:
+      slot:
+        description: '检查时段（决定通知策略）'
+        type: choice
+        default: morning
+        options:
+          - morning
+          - evening
   schedule:
-    - cron: '7 2 * * *'
-    - cron: '7 13 * * *'
+    - cron: '7 18 * * *'
+    - cron: '7 5 * * *'
 
 # 同一时间只允许一个检查实例，避免并发冲突
 concurrency:
@@ -44,6 +53,24 @@ jobs:
           node-version: 20
       - name: Install
         run: npm ci || npm install
+
+      # 时段归属：由触发的 cron 表达式决定（早=18:07 UTC 那条，晚=05:07 UTC 那条），
+      # 与实际执行时刻无关——GitHub 调度延迟不会改变早晚语义。
+      - name: Determine check slot
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+          INPUT_SLOT: ${{ inputs.slot }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            slot="${INPUT_SLOT:-morning}"
+          elif [ "$EVENT_SCHEDULE" = "7 18 * * *" ]; then
+            slot=morning
+          else
+            slot=evening
+          fi
+          echo "CHECK_SLOT=$slot" >> "$GITHUB_ENV"
+          echo "检查时段: $slot (event=$EVENT_NAME schedule='$EVENT_SCHEDULE')"
 
       # 检查前先确认协议没变。宽松模式：只打印告警，不阻断检查，
       # 避免误报；严重变化由独立的 guard.yml 严格告警。
